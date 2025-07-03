@@ -529,12 +529,12 @@ import { ElMessageBox } from 'element-plus'
 import { usePPStore } from '@/store'
 import {
     readFile,
-    readTextFile,
     writeTextFile,
     exists,
     remove,
     writeFile,
     rename,
+    mkdir,
 } from '@tauri-apps/plugin-fs'
 import {
     appCacheDir,
@@ -931,15 +931,12 @@ const switchTauriConfig = () => {
 }
 
 // icon confirm
-const confirmIcon = (base64Data: string) => {
+const confirmIcon = async (base64Data: string) => {
     cutVisible.value = false
     iconBase64.value = base64Data
     store.currentProject.icon = base64Data
-    const image = new Image()
-    image.src = base64Data
-    image.onload = () => {
-        roundIcon.value = cropImageToRound(image)
-    }
+    // if local build, then set padding 50
+    roundIcon.value = await cropImageToRound(base64Data)
 }
 
 // platform change
@@ -989,12 +986,6 @@ const loadHtml = async () => {
         const isExists = await exists(indexHtml)
         if (isExists) {
             const files = await readDirRecursively(selected)
-            if (files.length >= fileLimitNumber) {
-                oneMessage.error(
-                    t('fileLimitNumber', { number: fileLimitNumber })
-                )
-                return
-            }
             const configUrl = `index.html (${t('moreAssets')}+${files.length})`
             store.currentProject.url = configUrl
             store.currentProject.htmlPath = selected
@@ -1140,7 +1131,7 @@ const handleFileChange = async (event: any) => {
     }
 }
 
-// 仓库是否已经存在该文件并获取sha, 不存在则创建
+// check if file exists in repo and get sha, if not, create it
 const upSrcFile = async (filePath: string, base64Content: string) => {
     const resSha = await githubApi.getFileSha(
         store.userInfo.login,
@@ -1160,7 +1151,7 @@ const upSrcFile = async (filePath: string, base64Content: string) => {
     } else {
         delete params.sha
     }
-    // 更新文件
+    // update file
     const updateRes: any = await githubApi.updateFileContent(
         store.userInfo.login,
         'PakePlus',
@@ -1598,29 +1589,31 @@ const easyLocal = async () => {
         : store.currentProject.name
     const targetExe = await join(targetDir, targetName, `${targetName}.exe`)
     if (platformName === 'windows') {
-        const ppExeDir: string = await invoke('get_exe_dir')
-        const rhExePath = await join(ppExeDir, 'data', 'rh.exe')
-        // exists
-        if (await exists(rhExePath)) {
-            console.log('rh.exe exists')
+        const appDataDirPath = await appDataDir()
+        if (await exists(appDataDirPath)) {
+            console.log('appDataDirPath exists')
         } else {
-            await invoke('download_file', {
-                url: rhExeUrl,
-                savePath: rhExePath,
-                fileId: 'rh.exe',
-            })
+            await mkdir(appDataDirPath, { recursive: true })
         }
         // ico save to local
         const base64String = store.currentProject.iconRound
             ? roundIcon.value
             : iconBase64.value
         const icoBlob = await base64PngToIco(base64String)
-        const icoPath = await join(ppExeDir, 'data', 'app.ico')
+        const icoPath = await join(appDataDirPath, 'app.ico')
         await writeFile(icoPath, icoBlob)
         // save rhscript.txt
         const rhscript = await readStaticFile('rhscript.txt')
-        const rhtarget = rhscript.replace('Target.exe', targetExe)
-        const rhscriptPath = await join(ppExeDir, 'data', 'rhscript.txt')
+        // replace ppexe path
+        const ppexePath: string = await invoke('get_exe_dir', { parent: false })
+        // log path
+        const logPath: string = await join(appDataDirPath, 'rh.log')
+        const rhtarget = rhscript
+            .replace('PakePlus.exe', ppexePath)
+            .replace('Target.exe', targetExe)
+            .replace('rh.log', logPath)
+            .replace('app.ico', icoPath)
+        const rhscriptPath = await join(appDataDirPath, 'rhscript.txt')
         await writeTextFile(rhscriptPath, rhtarget)
     } else {
         targetName = store.currentProject.showName
@@ -1631,9 +1624,14 @@ const easyLocal = async () => {
         targetDir: targetDir,
         exeName: targetName,
         config: store.currentProject.more.windows,
-        base64Png: store.currentProject.iconRound
-            ? roundIcon.value
-            : iconBase64.value,
+        base64Png:
+            platformName === 'windows'
+                ? store.currentProject.iconRound
+                    ? roundIcon.value
+                    : iconBase64.value
+                : store.currentProject.iconRound
+                ? await cropImageToRound(roundIcon.value, 50)
+                : iconBase64.value,
         debug: store.currentProject.desktop.debug,
         customJs: await getInitializationScript(true),
         htmlPath: store.currentProject.htmlPath,
@@ -1707,6 +1705,7 @@ const publishWeb = async () => {
             confirmButtonText: t('confirm'),
             type: 'warning',
             center: true,
+            showCancelButton: false,
         }).finally(() => {
             openUrl(urlMap.questiondoc)
         })
@@ -1722,9 +1721,20 @@ const publishCheck = async () => {
     loadingText(t('preCheck') + '...')
     await new Promise((resolve) => setTimeout(resolve, 3000))
     if (store.currentProject.desktop.buildMethod === 'local') {
-        await easyLocal()
+        try {
+            await easyLocal()
+        } catch (error: any) {
+            console.error('easyLocal error', error)
+            warning.value = error.message
+            buildLoading.value = false
+            buildSecondTimer && clearInterval(buildSecondTimer)
+            buildTime = 0
+            buildRate.value = 0
+            return
+        }
     } else if (store.token === '') {
         oneMessage.error(t('configToken'))
+        buildLoading.value = false
         return
     } else {
         if (checkLastPublish()) {
